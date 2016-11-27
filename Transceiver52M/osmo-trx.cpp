@@ -37,14 +37,17 @@
  *     1 - Uses minimized modulator (less computation, more distortion)
  *
  *     Other values are invalid. Receive path (uplink) is always
- *     downsampled to 1 sps. Default to 4 sps for all cases except for
- *     ARM and non-SIMD enabled architectures.
+ *     downsampled to 1 sps. Default to 4 sps for all cases.
  */
-#if defined(HAVE_NEON) || !defined(HAVE_SSE3)
-#define DEFAULT_SPS		1
-#else
-#define DEFAULT_SPS		4
-#endif
+#define DEFAULT_TX_SPS		4
+
+/*
+ * Samples-per-symbol for uplink (receiver) path
+ *     Do not modify this value. EDGE configures 4 sps automatically on
+ *     B200/B210 devices only. Use of 4 sps on the receive path for other
+ *     configurations is not supported.
+ */
+#define DEFAULT_RX_SPS		1
 
 /* Default configuration parameters
  *     Note that these values are only used if the particular key does not
@@ -63,15 +66,20 @@ struct trx_config {
 	std::string addr;
 	std::string dev_args;
 	unsigned port;
-	unsigned sps;
+	unsigned tx_sps;
+	unsigned rx_sps;
 	unsigned chans;
 	unsigned rtsc;
+	unsigned rach_delay;
 	bool extref;
+	bool gpsref;
 	Transceiver::FillerType filler;
 	bool diversity;
+	bool mcbts;
 	double offset;
 	double rssi_offset;
 	bool swap_channels;
+	bool edge;
 };
 
 ConfigurationTable gConfig;
@@ -121,7 +129,7 @@ bool testConfig()
  */
 bool trx_setup_config(struct trx_config *config)
 {
-	std::string refstr, fillstr, divstr;
+	std::string refstr, fillstr, divstr, mcstr, edgestr;
 
 	if (!testConfig())
 		return false;
@@ -157,12 +165,25 @@ bool trx_setup_config(struct trx_config *config)
 			config->diversity = DEFAULT_DIVERSITY;
 	}
 
-	/* Diversity only supported on 2 channels */
-	if (config->diversity)
-		config->chans = 2;
+	if (!config->chans)
+		config->chans = DEFAULT_CHANS;
 
-	refstr = config->extref ? "Enabled" : "Disabled";
+	if (config->mcbts && ((config->chans < 0) || (config->chans > 5))) {
+		std::cout << "Unsupported number of channels" << std::endl;
+		return false;
+	}
+
+	edgestr = config->edge ? "Enabled" : "Disabled";
 	divstr = config->diversity ? "Enabled" : "Disabled";
+	mcstr = config->mcbts ? "Enabled" : "Disabled";
+
+	if (config->extref)
+		refstr = "External";
+	else if (config->gpsref)
+		refstr = "GPS";
+	else
+		refstr = "Internal";
+
 	switch (config->filler) {
 	case Transceiver::FILLER_DUMMY:
 		fillstr = "Dummy bursts";
@@ -170,8 +191,14 @@ bool trx_setup_config(struct trx_config *config)
 	case Transceiver::FILLER_ZERO:
 		fillstr = "Disabled";
 		break;
-	case Transceiver::FILLER_RAND:
+	case Transceiver::FILLER_NORM_RAND:
 		fillstr = "Normal busrts with random payload";
+		break;
+	case Transceiver::FILLER_EDGE_RAND:
+		fillstr = "EDGE busrts with random payload";
+		break;
+	case Transceiver::FILLER_ACCESS_RAND:
+		fillstr = "Access busrts with random payload";
 		break;
 	}
 
@@ -182,9 +209,12 @@ bool trx_setup_config(struct trx_config *config)
 	ost << "   TRX Base Port........... " << config->port << std::endl;
 	ost << "   TRX Address............. " << config->addr << std::endl;
 	ost << "   Channels................ " << config->chans << std::endl;
-	ost << "   Samples-per-Symbol...... " << config->sps << std::endl;
-	ost << "   External Reference...... " << refstr << std::endl;
+	ost << "   Tx Samples-per-Symbol... " << config->tx_sps << std::endl;
+	ost << "   Rx Samples-per-Symbol... " << config->rx_sps << std::endl;
+	ost << "   EDGE support............ " << edgestr << std::endl;
+	ost << "   Reference............... " << refstr << std::endl;
 	ost << "   C0 Filler Table......... " << fillstr << std::endl;
+	ost << "   Multi-Carrier........... " << mcstr << std::endl;
 	ost << "   Diversity............... " << divstr << std::endl;
 	ost << "   Tuning offset........... " << config->offset << std::endl;
 	ost << "   RSSI to dBm offset...... " << config->rssi_offset << std::endl;
@@ -208,16 +238,23 @@ RadioInterface *makeRadioInterface(struct trx_config *config,
 
 	switch (type) {
 	case RadioDevice::NORMAL:
-		radio = new RadioInterface(usrp, config->sps, config->chans);
+		radio = new RadioInterface(usrp, config->tx_sps,
+					   config->rx_sps, config->chans);
 		break;
 	case RadioDevice::RESAMP_64M:
 	case RadioDevice::RESAMP_100M:
-		radio = new RadioInterfaceResamp(usrp,
-						 config->sps, config->chans);
+		radio = new RadioInterfaceResamp(usrp, config->tx_sps,
+						 config->rx_sps);
 		break;
 	case RadioDevice::DIVERSITY:
-		radio = new RadioInterfaceDiversity(usrp,
-						    config->sps, config->chans);
+
+
+		radio = new RadioInterfaceDiversity(usrp, config->tx_sps,
+						    config->chans);
+		break;
+	case RadioDevice::MULTI_ARFCN:
+		radio = new RadioInterfaceMulti(usrp, config->tx_sps,
+						config->rx_sps, config->chans);
 		break;
 	default:
 		LOG(ALERT) << "Unsupported radio interface configuration";
@@ -243,9 +280,11 @@ Transceiver *makeTransceiver(struct trx_config *config, RadioInterface *radio)
 	Transceiver *trx;
 	VectorFIFO *fifo;
 
-	trx = new Transceiver(config->port, config->addr.c_str(), config->sps,
-		config->chans, GSM::Time(3,0), radio, config->rssi_offset);
-	if (!trx->init(config->filler, config->rtsc)) {
+	trx = new Transceiver(config->port, config->addr.c_str(),
+			      config->tx_sps, config->rx_sps, config->chans,
+			      GSM::Time(3,0), radio, config->rssi_offset);
+	if (!trx->init(config->filler, config->rtsc,
+		       config->rach_delay, config->edge)) {
 		LOG(ALERT) << "Failed to initialize transceiver";
 		delete trx;
 		return NULL;
@@ -290,13 +329,18 @@ static void print_help()
 		"  -l    Logging level (%s)\n"
 		"  -i    IP address of GSM core\n"
 		"  -p    Base port number\n"
-		"  -d    Enable dual channel diversity receiver\n"
+		"  -e    Enable EDGE receiver\n"
+		"  -d    Enable dual channel diversity receiver (deprecated)\n"
+		"  -m    Enable multi-ARFCN transceiver (default=disabled)\n"
 		"  -x    Enable external 10 MHz reference\n"
-		"  -s    Samples-per-symbol (1 or 4)\n"
+		"  -g    Enable GPSDO reference\n"
+		"  -s    Tx samples-per-symbol (1 or 4)\n"
+		"  -b    Rx samples-per-symbol (1 or 4)\n"
 		"  -c    Number of ARFCN channels (default=1)\n"
 		"  -f    Enable C0 filler table\n"
 		"  -o    Set baseband frequency offset (default=auto)\n"
-		"  -r    Random burst test mode with TSC\n"
+		"  -r    Random Normal Burst test mode with TSC\n"
+		"  -A    Random Access Burst test mode with delay\n"
 		"  -R    RSSI to dBm offset in dB (default=0)\n"
 		"  -S    Swap channels (UmTRX only)\n",
 		"EMERG, ALERT, CRT, ERR, WARNING, NOTICE, INFO, DEBUG");
@@ -307,17 +351,22 @@ static void handle_options(int argc, char **argv, struct trx_config *config)
 	int option;
 
 	config->port = 0;
-	config->sps = DEFAULT_SPS;
+	config->tx_sps = DEFAULT_TX_SPS;
+	config->rx_sps = DEFAULT_RX_SPS;
 	config->chans = DEFAULT_CHANS;
 	config->rtsc = 0;
+	config->rach_delay = 0;
 	config->extref = false;
+	config->gpsref = false;
 	config->filler = Transceiver::FILLER_ZERO;
+	config->mcbts = false;
 	config->diversity = false;
 	config->offset = 0.0;
 	config->rssi_offset = 0.0;
 	config->swap_channels = false;
+	config->edge = false;
 
-	while ((option = getopt(argc, argv, "ha:l:i:p:c:dxfo:s:r:R:S")) != -1) {
+	while ((option = getopt(argc, argv, "ha:l:i:p:c:dmxgfo:s:b:r:A:R:Se")) != -1) {
 		switch (option) {
 		case 'h':
 			print_help();
@@ -338,11 +387,17 @@ static void handle_options(int argc, char **argv, struct trx_config *config)
 		case 'c':
 			config->chans = atoi(optarg);
 			break;
+		case 'm':
+			config->mcbts = true;
+			break;
 		case 'd':
 			config->diversity = true;
 			break;
 		case 'x':
 			config->extref = true;
+			break;
+		case 'g':
+			config->gpsref = true;
 			break;
 		case 'f':
 			config->filler = Transceiver::FILLER_DUMMY;
@@ -351,11 +406,18 @@ static void handle_options(int argc, char **argv, struct trx_config *config)
 			config->offset = atof(optarg);
 			break;
 		case 's':
-			config->sps = atoi(optarg);
+			config->tx_sps = atoi(optarg);
+			break;
+		case 'b':
+			config->rx_sps = atoi(optarg);
 			break;
 		case 'r':
 			config->rtsc = atoi(optarg);
-			config->filler = Transceiver::FILLER_RAND;
+			config->filler = Transceiver::FILLER_NORM_RAND;
+			break;
+		case 'A':
+			config->rach_delay = atoi(optarg);
+			config->filler = Transceiver::FILLER_ACCESS_RAND;
 			break;
 		case 'R':
 			config->rssi_offset = atof(optarg);
@@ -363,31 +425,77 @@ static void handle_options(int argc, char **argv, struct trx_config *config)
 		case 'S':
 			config->swap_channels = true;
 			break;
+		case 'e':
+			config->edge = true;
+			break;
 		default:
 			print_help();
 			exit(0);
 		}
 	}
 
-	if ((config->sps != 1) && (config->sps != 4)) {
-		printf("Unsupported samples-per-symbol %i\n\n", config->sps);
-		print_help();
-		exit(0);
+	/* Force 4 SPS for EDGE or multi-ARFCN configurations */
+	if ((config->edge) || (config->mcbts)) {
+		config->tx_sps = 4;
+		config->rx_sps = 4;
+	}
+
+	if (config->gpsref && config->extref) {
+		printf("External and GPSDO references unavailable at the same time\n\n");
+		goto bad_config;
+	}
+
+	/* Special restrictions on (deprecated) diversity configuration */
+	if (config->diversity) {
+		if (config->mcbts || config->edge) {
+			std::cout << "Multi-carrier/EDGE diversity unsupported" << std::endl;
+			goto bad_config;
+		}
+
+		if (config->rx_sps != 1) {
+			std::cout << "Diversity only supported with 1 SPS" << std::endl;
+			goto bad_config;
+		}
+
+		if (config->chans != 2) {
+			std::cout << "Diversity only supported with 2 channels" << std::endl;
+			goto bad_config;
+		}
+	}
+
+	if (config->edge && (config->filler == Transceiver::FILLER_NORM_RAND))
+		config->filler = Transceiver::FILLER_EDGE_RAND;
+
+	if ((config->tx_sps != 1) && (config->tx_sps != 4) &&
+	    (config->rx_sps != 1) && (config->rx_sps != 4)) {
+		printf("Unsupported samples-per-symbol %i\n\n", config->tx_sps);
+		goto bad_config;
 	}
 
 	if (config->rtsc > 7) {
 		printf("Invalid training sequence %i\n\n", config->rtsc);
-		print_help();
-		exit(0);
+		goto bad_config;
 	}
+
+	if (config->rach_delay > 68) {
+		printf("RACH delay is too big %i\n\n", config->rach_delay);
+		goto bad_config;
+	}
+
+	return;
+
+bad_config:
+	print_help();
+	exit(0);
 }
 
 int main(int argc, char *argv[])
 {
-	int type, chans;
+	int type, chans, ref;
 	RadioDevice *usrp;
 	RadioInterface *radio = NULL;
 	Transceiver *trx = NULL;
+	RadioDevice::InterfaceType iface = RadioDevice::NORMAL;
 	struct trx_config config;
 
 	handle_options(argc, argv, &config);
@@ -405,9 +513,19 @@ int main(int argc, char *argv[])
 	srandom(time(NULL));
 
 	/* Create the low level device object */
-	usrp = RadioDevice::make(config.sps, config.chans,
-				 config.diversity, config.offset);
-	type = usrp->open(config.dev_args, config.extref, config.swap_channels);
+	if (config.mcbts)
+		iface = RadioDevice::MULTI_ARFCN;
+
+	if (config.extref)
+		ref = RadioDevice::REF_EXTERNAL;
+	else if (config.gpsref)
+		ref = RadioDevice::REF_GPS;
+	else
+		ref = RadioDevice::REF_INTERNAL;
+
+	usrp = RadioDevice::make(config.tx_sps, config.rx_sps, iface,
+				 config.chans, config.offset);
+	type = usrp->open(config.dev_args, ref, config.swap_channels);
 	if (type < 0) {
 		LOG(ALERT) << "Failed to create radio device" << std::endl;
 		goto shutdown;

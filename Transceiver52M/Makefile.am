@@ -21,7 +21,7 @@
 
 include $(top_srcdir)/Makefile.common
 
-AM_CPPFLAGS = -Wall $(STD_DEFINES_AND_INCLUDES) -I./common
+AM_CPPFLAGS = -Wall $(STD_DEFINES_AND_INCLUDES) -I${srcdir}/common
 AM_CXXFLAGS = -ldl -lpthread
 
 SUBDIRS = arm x86
@@ -54,14 +54,20 @@ COMMON_SOURCES = \
 	radioInterface.cpp \
 	radioVector.cpp \
 	radioClock.cpp \
+	radioBuffer.cpp \
 	sigProcLib.cpp \
 	signalVector.cpp \
-	Transceiver.cpp
+	Transceiver.cpp \
+	ChannelizerBase.cpp \
+	Channelizer.cpp \
+	Synthesis.cpp \
+	common/fft.c
 
 libtransceiver_la_SOURCES = \
 	$(COMMON_SOURCES) \
 	Resampler.cpp \
 	radioInterfaceResamp.cpp \
+	radioInterfaceMulti.cpp \
 	radioInterfaceDiversity.cpp
 
 bin_PROGRAMS = osmo-trx
@@ -72,15 +78,20 @@ noinst_HEADERS = \
 	radioVector.h \
 	radioClock.h \
 	radioDevice.h \
+	radioBuffer.h \
 	sigProcLib.h \
 	signalVector.h \
 	Transceiver.h \
 	USRPDevice.h \
 	Resampler.h \
+	ChannelizerBase.h \
+	Channelizer.h \
+	Synthesis.h \
 	common/convolve.h \
 	common/convert.h \
 	common/scale.h \
-	common/mult.h
+	common/mult.h \
+	common/fft.h
 
 osmo_trx_SOURCES = osmo-trx.cpp
 osmo_trx_LDADD = \
@@ -94,5 +105,5 @@ libtransceiver_la_SOURCES += USRPDevice.cpp
 osmo_trx_LDADD += $(USRP_LIBS)
 else
 libtransceiver_la_SOURCES += UHDDevice.cpp
-osmo_trx_LDADD += $(UHD_LIBS)
+osmo_trx_LDADD += $(UHD_LIBS) $(FFTWF_LIBS)
 endif

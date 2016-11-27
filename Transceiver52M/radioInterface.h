@@ -20,7 +20,10 @@
 #include "radioDevice.h"
 #include "radioVector.h"
 #include "radioClock.h"
+#include "radioBuffer.h"
 #include "Resampler.h"
+#include "Channelizer.h"
+#include "Synthesis.h"
 
 static const unsigned gSlotLen = 148;      ///< number of symbols per slot, not counting guard periods
 
@@ -40,10 +43,8 @@ protected:
   size_t mChans;
   size_t mMIMO;
 
-  std::vector<signalVector *> sendBuffer;
-  std::vector<signalVector *> recvBuffer;
-  unsigned sendCursor;
-  unsigned recvCursor;
+  std::vector<RadioBuffer *> sendBuffer;
+  std::vector<RadioBuffer *> recvBuffer;
 
   std::vector<short *> convertRecvBuffer;
   std::vector<short *> convertSendBuffer;
@@ -61,16 +62,14 @@ protected:
 
 private:
 
-  /** format samples to USRP */ 
-  int radioifyVector(signalVector &wVector,
-                     float *floatVector,
-                     bool zero);
+  /** format samples to USRP */
+  int radioifyVector(signalVector &wVector, size_t chan, bool zero);
 
   /** format samples from USRP */
-  int unRadioifyVector(float *floatVector, signalVector &wVector);
+  int unRadioifyVector(signalVector *wVector, size_t chan);
 
   /** push GSM bursts into the transmit buffer */
-  virtual void pushBuffer(void);
+  virtual bool pushBuffer(void);
 
   /** pull GSM bursts from the receive buffer */
   virtual void pullBuffer(void);
@@ -86,8 +85,8 @@ public:
   virtual void close();
 
   /** constructor */
-  RadioInterface(RadioDevice* wRadio = NULL,
-                 size_t sps = 4, size_t chans = 1, size_t diversity = 1,
+  RadioInterface(RadioDevice* wRadio, size_t tx_sps, size_t rx_sps,
+		 size_t chans = 1, size_t diversity = 1,
                  int receiveOffset = 3, GSM::Time wStartTime = GSM::Time(0));
 
   /** destructor */
@@ -103,7 +102,7 @@ public:
   RadioClock* getClock(void) { return &mClock;};
 
   /** set transmit frequency */
-  bool tuneTx(double freq, size_t chan = 0);
+  virtual bool tuneTx(double freq, size_t chan = 0);
 
   /** set receive frequency */
   virtual bool tuneRx(double freq, size_t chan = 0);
@@ -151,30 +150,52 @@ void *AlignRadioServiceLoopAdapter(RadioInterface*);
 #endif
 
 class RadioInterfaceResamp : public RadioInterface {
-
 private:
-  signalVector *innerSendBuffer;
   signalVector *outerSendBuffer;
-  signalVector *innerRecvBuffer;
   signalVector *outerRecvBuffer;
 
-  void pushBuffer();
+  bool pushBuffer();
   void pullBuffer();
 
 public:
-
-  RadioInterfaceResamp(RadioDevice* wRadio, size_t wSPS = 4, size_t chans = 1);
-
+  RadioInterfaceResamp(RadioDevice* wRadio, size_t tx_sps, size_t rx_sps);
   ~RadioInterfaceResamp();
 
   bool init(int type);
   void close();
 };
 
+class RadioInterfaceMulti : public RadioInterface {
+private:
+  bool pushBuffer();
+  void pullBuffer();
+
+  signalVector *outerSendBuffer;
+  signalVector *outerRecvBuffer;
+  std::vector<signalVector *> history;
+  std::vector<bool> active;
+
+  Resampler *dnsampler;
+  Resampler *upsampler;
+  Channelizer *channelizer;
+  Synthesis *synthesis;
+
+public:
+  RadioInterfaceMulti(RadioDevice* radio, size_t tx_sps,
+                      size_t rx_sps, size_t chans = 1);
+  ~RadioInterfaceMulti();
+
+  bool init(int type);
+  void close();
+
+  bool tuneTx(double freq, size_t chan);
+  bool tuneRx(double freq, size_t chan);
+  double setRxGain(double dB, size_t chan);
+};
+
 class RadioInterfaceDiversity : public RadioInterface {
 public:
-  RadioInterfaceDiversity(RadioDevice* wRadio,
-                          size_t sps = 4, size_t chans = 2);
+  RadioInterfaceDiversity(RadioDevice* wRadio, size_t tx_sps, size_t chans);
 
   ~RadioInterfaceDiversity();
 
@@ -183,7 +204,7 @@ public:
   bool tuneRx(double freq, size_t chan);
 
 private:
-  std::vector<Resampler *> dnsamplers;
+  Resampler *dnsampler;
   std::vector<float> phases;
   signalVector *outerRecvBuffer;
 

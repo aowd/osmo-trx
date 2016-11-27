@@ -97,11 +97,9 @@ AS_IF([test "x$with_usrp1" = "xyes"], [
 ])
 
 AS_IF([test "x$with_usrp1" != "xyes"],[
-    PKG_CHECK_MODULES(UHD, uhd >= 003.009,
-        [AC_DEFINE(USE_UHD_3_9, 1, UHD version 3.9.0 or higher)],
-        [PKG_CHECK_MODULES(UHD, uhd >= 003.005.004)]
-    )
-    AC_DEFINE(USE_UHD, 1, All UHD versions)
+    PKG_CHECK_MODULES(UHD, uhd >= 003.009)
+    PKG_CHECK_MODULES(FFTWF, fftw3f)
+    AC_DEFINE(USE_UHD, 1, Using UHD driver)
 ])
 
 AS_IF([test "x$with_singledb" = "xyes"], [
@@ -118,6 +116,9 @@ AM_CONDITIONAL(ARCH_ARM, [test "x$with_neon" = "xyes" || test "x$with_neon_vfpv4
 AM_CONDITIONAL(ARCH_ARM_A15, [test "x$with_neon_vfpv4" = "xyes"])
 
 PKG_CHECK_MODULES(LIBUSB, libusb-1.0)
+
+AC_CHECK_HEADER([boost/config.hpp],[],
+    [AC_MSG_ERROR([boost/config.hpp not found, install e.g. libboost-dev])])
 
 dnl Output files
 AC_CONFIG_FILES([\

@@ -29,6 +29,7 @@
 #include "sigProcLib.h"
 #include "GSMCommon.h"
 #include "Logger.h"
+#include "Resampler.h"
 
 extern "C" {
 #include "convolve.h"
@@ -55,13 +56,30 @@ static const float M_2PI_F = (float)(2.0*M_PI);
 static const float M_1_2PI_F = 1/M_2PI_F;
 
 /* Precomputed rotation vectors */
-static signalVector *GMSKRotationN = NULL;
-static signalVector *GMSKReverseRotationN = NULL;
+static signalVector *GMSKRotation4 = NULL;
+static signalVector *GMSKReverseRotation4 = NULL;
 static signalVector *GMSKRotation1 = NULL;
 static signalVector *GMSKReverseRotation1 = NULL;
 
 /* Precomputed fractional delay filters */
 static signalVector *delayFilters[DELAYFILTS];
+
+static Complex<float> psk8_table[8] = {
+   Complex<float>(-0.70710678,  0.70710678),
+   Complex<float>( 0.0, -1.0),
+   Complex<float>( 0.0,  1.0),
+   Complex<float>( 0.70710678, -0.70710678),
+   Complex<float>(-1.0,  0.0),
+   Complex<float>(-0.70710678, -0.70710678),
+   Complex<float>( 0.70710678,  0.70710678),
+   Complex<float>( 1.0,  0.0),
+};
+
+/* Downsampling filterbank - 4 SPS to 1 SPS */
+#define DOWNSAMPLE_IN_LEN	624
+#define DOWNSAMPLE_OUT_LEN	156
+
+static Resampler *dnsampler = NULL;
 
 /*
  * RACH and midamble correlation waveforms. Store the buffer separately
@@ -92,8 +110,8 @@ struct CorrelationSequence {
  * for SSE instructions.
  */
 struct PulseSequence {
-  PulseSequence() : c0(NULL), c1(NULL), empty(NULL),
-		    c0_buffer(NULL), c1_buffer(NULL)
+  PulseSequence() : c0(NULL), c1(NULL), c0_inv(NULL), empty(NULL),
+		    c0_buffer(NULL), c1_buffer(NULL), c0_inv_buffer(NULL)
   {
   }
 
@@ -101,6 +119,7 @@ struct PulseSequence {
   {
     delete c0;
     delete c1;
+    delete c0_inv;
     delete empty;
     free(c0_buffer);
     free(c1_buffer);
@@ -108,21 +127,26 @@ struct PulseSequence {
 
   signalVector *c0;
   signalVector *c1;
+  signalVector *c0_inv;
   signalVector *empty;
   void *c0_buffer;
   void *c1_buffer;
+  void *c0_inv_buffer;
 };
 
-CorrelationSequence *gMidambles[] = {NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL};
-CorrelationSequence *gRACHSequence = NULL;
-PulseSequence *GSMPulse = NULL;
-PulseSequence *GSMPulse1 = NULL;
+static CorrelationSequence *gMidambles[] = {NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL};
+static CorrelationSequence *gEdgeMidambles[] = {NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL};
+static CorrelationSequence *gRACHSequence = NULL;
+static PulseSequence *GSMPulse1 = NULL;
+static PulseSequence *GSMPulse4 = NULL;
 
 void sigProcLibDestroy()
 {
   for (int i = 0; i < 8; i++) {
     delete gMidambles[i];
+    delete gEdgeMidambles[i];
     gMidambles[i] = NULL;
+    gEdgeMidambles[i] = NULL;
   }
 
   for (int i = 0; i < DELAYFILTS; i++) {
@@ -130,21 +154,22 @@ void sigProcLibDestroy()
     delayFilters[i] = NULL;
   }
 
-  delete GMSKRotationN;
-  delete GMSKReverseRotationN;
   delete GMSKRotation1;
   delete GMSKReverseRotation1;
+  delete GMSKRotation4;
+  delete GMSKReverseRotation4;
   delete gRACHSequence;
-  delete GSMPulse;
   delete GSMPulse1;
+  delete GSMPulse4;
+  delete dnsampler;
 
-  GMSKRotationN = NULL;
   GMSKRotation1 = NULL;
-  GMSKReverseRotationN = NULL;
+  GMSKRotation4 = NULL;
+  GMSKReverseRotation4 = NULL;
   GMSKReverseRotation1 = NULL;
   gRACHSequence = NULL;
-  GSMPulse = NULL;
   GSMPulse1 = NULL;
+  GSMPulse4 = NULL;
 }
 
 // dB relative to 1.0.
@@ -253,7 +278,7 @@ float sinLookup(const float x)
 
 
 /** compute e^(-jx) via lookup table. */
-complex expjLookup(float x)
+static complex expjLookup(float x)
 {
   float arg = x*M_1_2PI_F;
   while (arg > 1.0F) arg -= 1.0F;
@@ -268,28 +293,33 @@ complex expjLookup(float x)
 }
 
 /** Library setup functions */
-void initTrigTables() {
+static void initTrigTables() {
   for (int i = 0; i < TABLESIZE+1; i++) {
     cosTable[i] = cos(2.0*M_PI*i/TABLESIZE);
     sinTable[i] = sin(2.0*M_PI*i/TABLESIZE);
   }
 }
 
-void initGMSKRotationTables(int sps)
+/*
+ * Initialize 4 sps and 1 sps rotation tables
+ */
+static void initGMSKRotationTables()
 {
-  GMSKRotationN = new signalVector(157 * sps);
-  GMSKReverseRotationN = new signalVector(157 * sps);
-  signalVector::iterator rotPtr = GMSKRotationN->begin();
-  signalVector::iterator revPtr = GMSKReverseRotationN->begin();
+  size_t len1 = 157, len4 = 625;
+
+  GMSKRotation4 = new signalVector(len4);
+  GMSKReverseRotation4 = new signalVector(len4);
+  signalVector::iterator rotPtr = GMSKRotation4->begin();
+  signalVector::iterator revPtr = GMSKReverseRotation4->begin();
   float phase = 0.0;
-  while (rotPtr != GMSKRotationN->end()) {
+  while (rotPtr != GMSKRotation4->end()) {
     *rotPtr++ = expjLookup(phase);
     *revPtr++ = expjLookup(-phase);
-    phase += M_PI_F / 2.0F / (float) sps;
+    phase += M_PI_F / 2.0F / 4.0;
   }
 
-  GMSKRotation1 = new signalVector(157);
-  GMSKReverseRotation1 = new signalVector(157);
+  GMSKRotation1 = new signalVector(len1);
+  GMSKReverseRotation1 = new signalVector(len1);
   rotPtr = GMSKRotation1->begin();
   revPtr = GMSKReverseRotation1->begin();
   phase = 0.0;
@@ -316,7 +346,7 @@ static void GMSKRotate(signalVector &x, int sps)
   if (sps == 1)
     b = GMSKRotation1;
   else
-    b = GMSKRotationN;
+    b = GMSKRotation4;
 
   mul_complex((float *) out->begin(),
               (float *) a->begin(),
@@ -327,7 +357,7 @@ static void GMSKRotate(signalVector &x, int sps)
   if (sps == 1)
     rotPtr = GMSKRotation1->begin();
   else
-    rotPtr = GMSKRotationN->begin();
+    rotPtr = GMSKRotation4->begin();
 
   if (x.isReal()) {
     while (xPtr < x.end()) {
@@ -344,14 +374,16 @@ static void GMSKRotate(signalVector &x, int sps)
 #endif
 }
 
-static void GMSKReverseRotate(signalVector &x, int sps)
+static bool GMSKReverseRotate(signalVector &x, int sps)
 {
   signalVector::iterator rotPtr, xPtr= x.begin();
 
   if (sps == 1)
     rotPtr = GMSKReverseRotation1->begin();
+  else if (sps == 4)
+    rotPtr = GMSKReverseRotation4->begin();
   else
-    rotPtr = GMSKReverseRotationN->begin();
+    return false;
 
   if (x.isReal()) {
     while (xPtr < x.end()) {
@@ -365,6 +397,8 @@ static void GMSKReverseRotate(signalVector &x, int sps)
       xPtr++;
     }
   }
+
+  return true;
 }
 
 signalVector *convolve(const signalVector *x,
@@ -471,6 +505,31 @@ signalVector *convolve(const signalVector *x,
   return y;
 }
 
+/*
+ * Generate static EDGE linear equalizer. This equalizer is not adaptive.
+ * Filter taps are generated from the inverted 1 SPS impulse response of
+ * the EDGE pulse shape captured after the downsampling filter.
+ */
+static bool generateInvertC0Pulse(PulseSequence *pulse)
+{
+  if (!pulse)
+    return false;
+
+  pulse->c0_inv_buffer = convolve_h_alloc(5);
+  pulse->c0_inv = new signalVector((complex *) pulse->c0_inv_buffer, 0, 5);
+  pulse->c0_inv->isReal(true);
+  pulse->c0_inv->setAligned(false);
+
+  signalVector::iterator xP = pulse->c0_inv->begin();
+  *xP++ = 0.15884;
+  *xP++ = -0.43176;
+  *xP++ = 1.00000;
+  *xP++ = -0.42608;
+  *xP++ = 0.14882;
+
+  return true;
+}
+
 static bool generateC1Pulse(int sps, PulseSequence *pulse)
 {
   int len;
@@ -512,11 +571,14 @@ static bool generateC1Pulse(int sps, PulseSequence *pulse)
   return true;
 }
 
-static PulseSequence *generateGSMPulse(int sps, int symbolLength)
+static PulseSequence *generateGSMPulse(int sps)
 {
   int len;
   float arg, avg, center;
   PulseSequence *pulse;
+
+  if ((sps != 1) && (sps != 4))
+    return NULL;
 
   /* Store a single tap filter used for correlation sequence generation */
   pulse = new PulseSequence();
@@ -534,10 +596,9 @@ static PulseSequence *generateGSMPulse(int sps, int symbolLength)
   case 4:
     len = 16;
     break;
+  case 1:
   default:
-    len = sps * symbolLength;
-    if (len < 4)
-      len = 4;
+    len = 4;
   }
 
   pulse->c0_buffer = convolve_h_alloc(len);
@@ -582,6 +643,13 @@ static PulseSequence *generateGSMPulse(int sps, int symbolLength)
     for (int i = 0; i < len; i++)
       *xP++ /= avg;
   }
+
+  /*
+   * Current form of the EDGE equalization filter non-realizable at 4 SPS.
+   * Load the onto both 1 SPS and 4 SPS objects for convenience. Note that
+   * the EDGE demodulator downsamples to 1 SPS prior to equalization.
+   */
+  generateInvertC0Pulse(pulse);
 
   return pulse;
 }
@@ -654,8 +722,22 @@ signalVector* reverseConjugate(signalVector *b)
     return tmp;
 }
 
-/* soft output slicer */
-bool vectorSlicer(signalVector *x) 
+bool vectorSlicer(SoftVector *x)
+{
+  SoftVector::iterator xP = x->begin();
+  SoftVector::iterator xPEnd = x->end();
+  while (xP < xPEnd) {
+    *xP = 0.5 * (*xP + 1.0f);
+    if (*xP > 1.0)
+      *xP = 1.0;
+    if (*xP < 0.0)
+      *xP = 0.0;
+    xP++;
+  }
+  return true;
+}
+
+bool vectorSlicer(signalVector *x)
 {
 
   signalVector::iterator xP = x->begin();
@@ -697,26 +779,34 @@ static signalVector *rotateBurst(const BitVector &wBurst,
   return shaped;
 }
 
-static signalVector *modulateBurstLaurent(const BitVector &bits,
-					  int guard_len, int sps)
+static void rotateBurst2(signalVector &burst, double phase)
 {
-  int burst_len;
+  Complex<float> rot = Complex<float>(cos(phase), sin(phase));
+
+  for (size_t i = 0; i < burst.size(); i++)
+    burst[i] = burst[i] * rot;
+}
+
+/*
+ * Ignore the guard length argument in the GMSK modulator interface
+ * because it results in 624/628 sized bursts instead of the preferred
+ * burst length of 625. Only 4 SPS is supported.
+ */
+static signalVector *modulateBurstLaurent(const BitVector &bits)
+{
+  int burst_len, sps = 4;
   float phase;
   signalVector *c0_pulse, *c1_pulse, *c0_burst;
   signalVector *c1_burst, *c0_shaped, *c1_shaped;
   signalVector::iterator c0_itr, c1_itr;
 
-  /*
-   * Apply before and after bits to reduce phase error at burst edges.
-   * Make sure there is enough room in the burst to accomodate all bits.
-   */
-  if (guard_len < 4)
-    guard_len = 4;
+  c0_pulse = GSMPulse4->c0;
+  c1_pulse = GSMPulse4->c1;
 
-  c0_pulse = GSMPulse->c0;
-  c1_pulse = GSMPulse->c1;
+  if (bits.size() > 156)
+    return NULL;
 
-  burst_len = sps * (bits.size() + guard_len);
+  burst_len = 625;
 
   c0_burst = new signalVector(burst_len, c0_pulse->size());
   c0_burst->isReal(true);
@@ -726,8 +816,8 @@ static signalVector *modulateBurstLaurent(const BitVector &bits,
   c1_burst->isReal(true);
   c1_itr = c1_burst->begin();
 
-  /* Padded differential start bits */
-  *c0_itr = 2.0 * (0x01 & 0x01) - 1.0;
+  /* Padded differential tail bits */
+  *c0_itr = 2.0 * (0x00 & 0x01) - 1.0;
   c0_itr += sps;
 
   /* Main burst bits */
@@ -736,8 +826,8 @@ static signalVector *modulateBurstLaurent(const BitVector &bits,
     c0_itr += sps;
   }
 
-  /* Padded differential end bits */
-  *c0_itr = 2.0 * (0x01 & 0x01) - 1.0;
+  /* Padded differential tail bits */
+  *c0_itr = 2.0 * (0x00 & 0x01) - 1.0;
 
   /* Generate C0 phase coefficients */
   GMSKRotate(*c0_burst, sps);
@@ -784,6 +874,281 @@ static signalVector *modulateBurstLaurent(const BitVector &bits,
   return c0_shaped;
 }
 
+static signalVector *rotateEdgeBurst(const signalVector &symbols, int sps)
+{
+  signalVector *burst;
+  signalVector::iterator burst_itr;
+
+  burst = new signalVector(symbols.size() * sps);
+  burst_itr = burst->begin();
+
+  for (size_t i = 0; i < symbols.size(); i++) {
+    float phase = i * 3.0f * M_PI / 8.0f;
+    Complex<float> rot = Complex<float>(cos(phase), sin(phase));
+
+    *burst_itr = symbols[i] * rot;
+    burst_itr += sps;
+  }
+
+  return burst;
+}
+
+static signalVector *derotateEdgeBurst(const signalVector &symbols, int sps)
+{
+  signalVector *burst;
+  signalVector::iterator burst_itr;
+
+  if (symbols.size() % sps)
+    return NULL;
+
+  burst = new signalVector(symbols.size() / sps);
+  burst_itr = burst->begin();
+
+  for (size_t i = 0; i < burst->size(); i++) {
+    float phase = (float) (i % 16) * 3.0f * M_PI / 8.0f;
+    Complex<float> rot = Complex<float>(cosf(phase), -sinf(phase));
+
+    *burst_itr = symbols[sps * i] * rot;
+    burst_itr++;
+  }
+
+  return burst;
+}
+
+static signalVector *mapEdgeSymbols(const BitVector &bits)
+{
+  if (bits.size() % 3)
+    return NULL;
+
+  signalVector *symbols = new signalVector(bits.size() / 3);
+
+  for (size_t i = 0; i < symbols->size(); i++) {
+    unsigned index = (((unsigned) bits[3 * i + 0] & 0x01) << 0) |
+                     (((unsigned) bits[3 * i + 1] & 0x01) << 1) |
+                     (((unsigned) bits[3 * i + 2] & 0x01) << 2);
+
+    (*symbols)[i] = psk8_table[index];
+  }
+
+  return symbols;
+}
+
+/*
+ * EDGE 8-PSK rotate and pulse shape
+ *
+ * Delay the EDGE downlink bursts by one symbol in order to match GMSK pulse
+ * shaping group delay. The difference in group delay arises from the dual
+ * pulse filter combination of the GMSK Laurent represenation whereas 8-PSK
+ * uses a single pulse linear filter.
+ */
+static signalVector *shapeEdgeBurst(const signalVector &symbols)
+{
+  size_t nsyms, nsamps = 625, sps = 4;
+  signalVector *burst, *shape;
+  signalVector::iterator burst_itr;
+
+  nsyms = symbols.size();
+
+  if (nsyms * sps > nsamps)
+    nsyms = 156;
+
+  burst = new signalVector(nsamps, GSMPulse4->c0->size());
+
+  /* Delay burst by 1 symbol */
+  burst_itr = burst->begin() + sps;
+  for (size_t i = 0; i < nsyms; i++) {
+    float phase = i * 3.0f * M_PI / 8.0f;
+    Complex<float> rot = Complex<float>(cos(phase), sin(phase));
+
+    *burst_itr = symbols[i] * rot;
+    burst_itr += sps;
+  }
+
+  /* Single Gaussian pulse approximation shaping */
+  shape = convolve(burst, GSMPulse4->c0, NULL, START_ONLY);
+  delete burst;
+
+  return shape;
+}
+
+/*
+ * Generate a random GSM normal burst.
+ */
+signalVector *genRandNormalBurst(int tsc, int sps, int tn)
+{
+  if ((tsc < 0) || (tsc > 7) || (tn < 0) || (tn > 7))
+    return NULL;
+  if ((sps != 1) && (sps != 4))
+    return NULL;
+
+  int i = 0;
+  BitVector *bits = new BitVector(148);
+  signalVector *burst;
+
+  /* Tail bits */
+  for (; i < 4; i++)
+    (*bits)[i] = 0;
+
+  /* Random bits */
+  for (; i < 61; i++)
+    (*bits)[i] = rand() % 2;
+
+  /* Training sequence */
+  for (int n = 0; i < 87; i++, n++)
+    (*bits)[i] = gTrainingSequence[tsc][n];
+
+  /* Random bits */
+  for (; i < 144; i++)
+    (*bits)[i] = rand() % 2;
+
+  /* Tail bits */
+  for (; i < 148; i++)
+    (*bits)[i] = 0;
+
+  int guard = 8 + !(tn % 4);
+  burst = modulateBurst(*bits, guard, sps);
+  delete bits;
+
+  return burst;
+}
+
+/*
+ * Generate a random GSM access burst.
+ */
+signalVector *genRandAccessBurst(int delay, int sps, int tn)
+{
+  if ((tn < 0) || (tn > 7))
+    return NULL;
+  if ((sps != 1) && (sps != 4))
+    return NULL;
+  if (delay > 68)
+    return NULL;
+
+  int i = 0;
+  BitVector *bits = new BitVector(88+delay);
+  signalVector *burst;
+
+  /* delay */
+  for (; i < delay; i++)
+    (*bits)[i] = 0;
+
+  /* head and synch bits */
+  for (int n = 0; i < 49+delay; i++, n++)
+    (*bits)[i] = gRACHBurst[n];
+
+  /* Random bits */
+  for (; i < 85+delay; i++)
+    (*bits)[i] = rand() % 2;
+
+  /* Tail bits */
+  for (; i < 88+delay; i++)
+    (*bits)[i] = 0;
+
+  int guard = 68-delay + !(tn % 4);
+  burst = modulateBurst(*bits, guard, sps);
+  delete bits;
+
+  return burst;
+}
+
+signalVector *generateEmptyBurst(int sps, int tn)
+{
+	if ((tn < 0) || (tn > 7))
+		return NULL;
+
+	if (sps == 4)
+		return new signalVector(625);
+	else if (sps == 1)
+		return new signalVector(148 + 8 + !(tn % 4));
+	else
+		return NULL;
+}
+
+signalVector *generateDummyBurst(int sps, int tn)
+{
+	if (((sps != 1) && (sps != 4)) || (tn < 0) || (tn > 7))
+		return NULL;
+
+	return modulateBurst(gDummyBurst, 8 + !(tn % 4), sps);
+}
+
+/*
+ * Generate a random 8-PSK EDGE burst. Only 4 SPS is supported with
+ * the returned burst being 625 samples in length.
+ */
+signalVector *generateEdgeBurst(int tsc)
+{
+  int tail = 9 / 3;
+  int data = 174 / 3;
+  int train = 78 / 3;
+
+  if ((tsc < 0) || (tsc > 7))
+    return NULL;
+
+  signalVector *shape, *burst = new signalVector(148);
+  const BitVector *midamble = &gEdgeTrainingSequence[tsc];
+
+  /* Tail */
+  int n, i = 0;
+  for (; i < tail; i++)
+    (*burst)[i] = psk8_table[7];
+
+  /* Body */
+  for (; i < tail + data; i++)
+    (*burst)[i] = psk8_table[rand() % 8];
+
+  /* TSC */
+  for (n = 0; i < tail + data + train; i++, n++) {
+    unsigned index = (((unsigned) (*midamble)[3 * n + 0] & 0x01) << 0) |
+                     (((unsigned) (*midamble)[3 * n + 1] & 0x01) << 1) |
+                     (((unsigned) (*midamble)[3 * n + 2] & 0x01) << 2);
+
+    (*burst)[i] = psk8_table[index];
+  }
+
+  /* Body */
+  for (; i < tail + data + train + data; i++)
+    (*burst)[i] = psk8_table[rand() % 8];
+
+  /* Tail */
+  for (; i < tail + data + train + data + tail; i++)
+    (*burst)[i] = psk8_table[7];
+
+  shape = shapeEdgeBurst(*burst);
+  delete burst;
+
+  return shape;
+}
+
+/*
+ * Modulate 8-PSK burst. When empty pulse shaping (rotation only)
+ * is enabled, the output vector length will be bit sequence length
+ * times the SPS value. When pulse shaping is enabled, the output
+ * vector length is fixed at 625 samples (156.25 sybols at 4 SPS).
+ * Pulse shaped bit sequences that go beyond one burst are truncated.
+ * Pulse shaping at anything but 4 SPS is not supported.
+ */
+signalVector *modulateEdgeBurst(const BitVector &bits,
+                                int sps, bool empty)
+{
+  signalVector *shape, *burst;
+
+  if ((sps != 4) && !empty)
+    return NULL;
+
+  burst = mapEdgeSymbols(bits);
+  if (!burst)
+    return NULL;
+
+  if (empty)
+    shape = rotateEdgeBurst(*burst, sps);
+  else
+    shape = shapeEdgeBurst(*burst);
+
+  delete burst;
+  return shape;
+}
+
 static signalVector *modulateBurstBasic(const BitVector &bits,
 					int guard_len, int sps)
 {
@@ -794,7 +1159,7 @@ static signalVector *modulateBurstBasic(const BitVector &bits,
   if (sps == 1)
     pulse = GSMPulse1->c0;
   else
-    pulse = GSMPulse->c0;
+    pulse = GSMPulse4->c0;
 
   burst_len = sps * (bits.size() + guard_len);
 
@@ -826,12 +1191,12 @@ signalVector *modulateBurst(const BitVector &wBurst, int guardPeriodLength,
   if (emptyPulse)
     return rotateBurst(wBurst, guardPeriodLength, sps);
   else if (sps == 4)
-    return modulateBurstLaurent(wBurst, guardPeriodLength, sps);
+    return modulateBurstLaurent(wBurst);
   else
     return modulateBurstBasic(wBurst, guardPeriodLength, sps);
 }
 
-void generateSincTable()
+static void generateSincTable()
 {
   float x;
 
@@ -1140,7 +1505,7 @@ bool multVector(signalVector &x,
   return true;
 }
 
-bool generateMidamble(int sps, int tsc)
+static bool generateMidamble(int sps, int tsc)
 {
   bool status = true;
   float toa;
@@ -1216,7 +1581,42 @@ release:
   return status;
 }
 
-bool generateRACHSequence(int sps)
+CorrelationSequence *generateEdgeMidamble(int tsc)
+{
+  complex *data = NULL;
+  signalVector *midamble = NULL, *_midamble = NULL;
+  CorrelationSequence *seq;
+
+  if ((tsc < 0) || (tsc > 7))
+    return NULL;
+
+  /* Use middle 48 bits of each TSC. Correlation sequence is not pulse shaped */
+  const BitVector *bits = &gEdgeTrainingSequence[tsc];
+  midamble = modulateEdgeBurst(bits->segment(15, 48), 1, true);
+  if (!midamble)
+    return NULL;
+
+  conjugateVector(*midamble);
+
+  data = (complex *) convolve_h_alloc(midamble->size());
+  _midamble = new signalVector(data, 0, midamble->size());
+  _midamble->setAligned(true);
+  memcpy(_midamble->begin(), midamble->begin(),
+	 midamble->size() * sizeof(complex));
+
+  /* Channel gain is an empirically measured value */
+  seq = new CorrelationSequence;
+  seq->buffer = data;
+  seq->sequence = _midamble;
+  seq->gain = Complex<float>(-19.6432, 19.5006) / 1.18;
+  seq->toa = 0;
+
+  delete midamble;
+
+  return seq;
+}
+
+static bool generateRACHSequence(int sps)
 {
   bool status = true;
   float toa;
@@ -1278,6 +1678,17 @@ release:
   return status;
 }
 
+/*
+ * Peak-to-average computation +/- range from peak in symbols
+ */
+#define COMPUTE_PEAK_MIN     2
+#define COMPUTE_PEAK_MAX     5
+
+/*
+ * Minimum number of values needed to compute peak-to-average
+ */
+#define COMPUTE_PEAK_CNT     5
+
 static float computePeakRatio(signalVector *corr,
                               int sps, float toa, complex amp)
 {
@@ -1291,7 +1702,7 @@ static float computePeakRatio(signalVector *corr,
 
   peak = corr->begin() + (int) rint(toa);
 
-  for (int i = 2 * sps; i <= 5 * sps; i++) {
+  for (int i = COMPUTE_PEAK_MIN * sps; i <= COMPUTE_PEAK_MAX * sps; i++) {
     if (peak - i >= corr->begin()) {
       avg += (peak - i)->norm2();
       num++;
@@ -1302,7 +1713,7 @@ static float computePeakRatio(signalVector *corr,
     }
   }
 
-  if (num < 2)
+  if (num < COMPUTE_PEAK_CNT)
     return 0.0;
 
   rms = sqrtf(avg / (float) num) + 0.00001;
@@ -1341,11 +1752,27 @@ static int detectBurst(signalVector &burst,
                        float thresh, int sps, complex *amp, float *toa,
                        int start, int len)
 {
+  signalVector *corr_in, *dec = NULL;
+
+  if (sps == 4) {
+    dec = downsampleBurst(burst);
+    corr_in = dec;
+    sps = 1;
+  } else {
+    corr_in = &burst;
+  }
+
   /* Correlate */
-  if (!convolve(&burst, sync->sequence, &corr,
-                CUSTOM, start, len, sps, 0)) {
+  if (!convolve(corr_in, sync->sequence, &corr,
+                CUSTOM, start, len, 1, 0)) {
+    delete dec;
     return -1;
   }
+
+  delete dec;
+
+  /* Running at the downsampled rate at this point */
+  sps = 1;
 
   /* Peak detection - place restrictions at correlation edges */
   *amp = fastPeakDetect(corr, toa);
@@ -1418,8 +1845,8 @@ int detectGeneralBurst(signalVector &rxBurst,
     clipping = true;
   }
 
-  start = (target - head) * sps - 1;
-  len = (head + tail) * sps;
+  start = target - head - 1;
+  len = head + tail;
   corr = new signalVector(len);
 
   rc = detectBurst(rxBurst, *corr, sync,
@@ -1435,7 +1862,7 @@ int detectGeneralBurst(signalVector &rxBurst,
   }
 
   /* Subtract forward search bits from delay */
-  toa -= head * sps;
+  toa -= head;
 
   return 1;
 }
@@ -1446,21 +1873,22 @@ int detectGeneralBurst(signalVector &rxBurst,
  *
  * Correlation window parameters:
  *   target: Tail bits + RACH length (reduced from 41 to a multiple of 4)
- *   head: Search 4 symbols before target 
- *   tail: Search 10 symbols after target
+ *   head: Search 8 symbols before target
+ *   tail: Search 8 symbols + maximum expected delay
  */
 int detectRACHBurst(signalVector &rxBurst,
             float thresh,
             int sps,
             complex &amp,
-            float &toa)
+            float &toa,
+            unsigned maxTOA)
 {
   int rc, target, head, tail;
   CorrelationSequence *sync;
 
   target = 8 + 40;
-  head = 4;
-  tail = 10;
+  head = 8;
+  tail = 8 + maxTOA;
   sync = gRACHSequence;
 
   rc = detectGeneralBurst(rxBurst, thresh, sps, amp, toa,
@@ -1474,12 +1902,11 @@ int detectRACHBurst(signalVector &rxBurst,
  *
  * Correlation window parameters:
  *   target: Tail + data + mid-midamble + 1/2 remaining midamblebits
- *   head: Search 4 symbols before target
- *   tail: Search 4 symbols + maximum expected delay
+ *   head: Search 6 symbols before target
+ *   tail: Search 6 symbols + maximum expected delay
  */
 int analyzeTrafficBurst(signalVector &rxBurst, unsigned tsc, float thresh,
-                        int sps, complex &amp, float &toa, unsigned max_toa,
-                        bool chan_req, signalVector **chan, float *chan_offset)
+                        int sps, complex &amp, float &toa, unsigned max_toa)
 {
   int rc, target, head, tail;
   CorrelationSequence *sync;
@@ -1488,23 +1915,47 @@ int analyzeTrafficBurst(signalVector &rxBurst, unsigned tsc, float thresh,
     return -SIGERR_UNSUPPORTED;
 
   target = 3 + 58 + 16 + 5;
-  head = 4;
-  tail = 4 + max_toa;
+  head = 6;
+  tail = 6 + max_toa;
   sync = gMidambles[tsc];
 
   rc = detectGeneralBurst(rxBurst, thresh, sps, amp, toa,
                           target, head, tail, sync);
-
-  /* Equalization not currently supported */
-  if (rc > 0 && chan_req) {
-    *chan = new signalVector(6 * sps);
-
-    if (chan_offset)
-      *chan_offset = 0.0;
-  }
-
   return rc;
 }
+
+int detectEdgeBurst(signalVector &rxBurst, unsigned tsc, float thresh,
+                    int sps, complex &amp, float &toa, unsigned max_toa)
+{
+  int rc, target, head, tail;
+  CorrelationSequence *sync;
+
+  if ((tsc < 0) || (tsc > 7))
+    return -SIGERR_UNSUPPORTED;
+
+  target = 3 + 58 + 16 + 5;
+  head = 6;
+  tail = 6 + max_toa;
+  sync = gEdgeMidambles[tsc];
+
+  rc = detectGeneralBurst(rxBurst, thresh, sps, amp, toa,
+                          target, head, tail, sync);
+  return rc;
+}
+
+signalVector *downsampleBurst(signalVector &burst)
+{
+  signalVector *in, *out;
+
+  in = new signalVector(DOWNSAMPLE_IN_LEN, dnsampler->len());
+  out = new signalVector(DOWNSAMPLE_OUT_LEN);
+  memcpy(in->begin(), burst.begin(), DOWNSAMPLE_IN_LEN * 2 * sizeof(float));
+
+  dnsampler->rotate((float *) in->begin(), DOWNSAMPLE_IN_LEN,
+                    (float *) out->begin(), DOWNSAMPLE_OUT_LEN);
+  delete in;
+  return out;
+};
 
 signalVector *decimateVector(signalVector &wVector, size_t factor)
 {
@@ -1523,27 +1974,98 @@ signalVector *decimateVector(signalVector &wVector, size_t factor)
   return dec;
 }
 
+/*
+ * Soft 8-PSK decoding using Manhattan distance metric
+ */
+static SoftVector *softSliceEdgeBurst(signalVector &burst)
+{
+  size_t nsyms = 148;
+
+  if (burst.size() < nsyms)
+    return NULL;
+
+  signalVector::iterator itr;
+  SoftVector *bits = new SoftVector(nsyms * 3);
+
+  /*
+   * Bits 0 and 1 - First and second bits of the symbol respectively
+   */
+  rotateBurst2(burst, -M_PI / 8.0);
+  itr = burst.begin();
+  for (size_t i = 0; i < nsyms; i++) {
+    (*bits)[3 * i + 0] = -itr->imag();
+    (*bits)[3 * i + 1] = itr->real();
+    itr++;
+  }
+
+  /*
+   * Bit 2 - Collapse symbols into quadrant 0 (positive X and Y).
+   * Decision area is then simplified to X=Y axis. Rotate again to
+   * place decision boundary on X-axis.
+   */
+  itr = burst.begin();
+  for (size_t i = 0; i < burst.size(); i++) {
+    burst[i] = Complex<float>(fabs(itr->real()), fabs(itr->imag()));
+    itr++;
+  }
+
+  rotateBurst2(burst, -M_PI / 4.0);
+  itr = burst.begin();
+  for (size_t i = 0; i < nsyms; i++) {
+    (*bits)[3 * i + 2] = -itr->imag();
+    itr++;
+  }
+
+  signalVector soft(bits->size());
+  for (size_t i = 0; i < bits->size(); i++)
+    soft[i] = (*bits)[i];
+
+  return bits;
+}
+
+/*
+ * Shared portion of GMSK and EDGE demodulators consisting of timing
+ * recovery and single tap channel correction. For 4 SPS (if activated),
+ * the output is downsampled prior to the 1 SPS modulation specific
+ * stages.
+ */
+static signalVector *demodCommon(signalVector &burst, int sps,
+                                 complex chan, float toa)
+{
+  signalVector *delay, *dec;
+
+  if ((sps != 1) && (sps != 4))
+    return NULL;
+
+  scaleVector(burst, (complex) 1.0 / chan);
+  delay = delayVector(&burst, NULL, -toa * (float) sps);
+
+  if (sps == 1)
+    return delay;
+
+  dec = downsampleBurst(*delay);
+
+  delete delay;
+  return dec;
+}
+
+/*
+ * Demodulate GSMK burst. Prior to symbol rotation, operate at
+ * 4 SPS (if activated) to minimize distortion through the fractional
+ * delay filters. Symbol rotation and after always operates at 1 SPS.
+ */
 SoftVector *demodulateBurst(signalVector &rxBurst, int sps,
                             complex channel, float TOA)
 {
-  signalVector *delay, *dec = NULL;
   SoftVector *bits;
+  signalVector *dec;
 
-  scaleVector(rxBurst, ((complex) 1.0) / channel);
-  delay = delayVector(&rxBurst, NULL, -TOA);
+  dec = demodCommon(rxBurst, sps, channel, TOA);
+  if (!dec)
+    return NULL;
 
   /* Shift up by a quarter of a frequency */
-  GMSKReverseRotate(*delay, sps);
-
-  /* Decimate and slice */
-  if (sps > 1) {
-     dec = decimateVector(*delay, sps);
-     delete delay;
-     delay = NULL;
-  } else {
-     dec = delay;
-  }
-
+  GMSKReverseRotate(*dec, 1);
   vectorSlicer(dec);
 
   bits = new SoftVector(dec->size());
@@ -1559,185 +2081,67 @@ SoftVector *demodulateBurst(signalVector &rxBurst, int sps,
   return bits;
 }
 
-// Assumes symbol-spaced sampling!!!
-// Based upon paper by Al-Dhahir and Cioffi
-bool designDFE(signalVector &channelResponse,
-	       float SNRestimate,
-	       int Nf,
-	       signalVector **feedForwardFilter,
-	       signalVector **feedbackFilter)
+/*
+ * Demodulate an 8-PSK burst. Prior to symbol rotation, operate at
+ * 4 SPS (if activated) to minimize distortion through the fractional
+ * delay filters. Symbol rotation and after always operates at 1 SPS.
+ *
+ * Allow 1 SPS demodulation here, but note that other parts of the
+ * transceiver restrict EDGE operatoin to 4 SPS - 8-PSK distortion
+ * through the fractional delay filters at 1 SPS renders signal
+ * nearly unrecoverable.
+ */
+SoftVector *demodEdgeBurst(signalVector &burst, int sps,
+                           complex chan, float toa)
 {
-  
-  signalVector G0(Nf);
-  signalVector G1(Nf);
-  signalVector::iterator G0ptr = G0.begin();
-  signalVector::iterator G1ptr = G1.begin();
-  signalVector::iterator chanPtr = channelResponse.begin();
+  SoftVector *bits;
+  signalVector *dec, *rot, *eq;
 
-  int nu = channelResponse.size()-1;
-
-  *G0ptr = 1.0/sqrtf(SNRestimate);
-  for(int j = 0; j <= nu; j++) {
-    *G1ptr = chanPtr->conj();
-    G1ptr++; chanPtr++;
-  }
-
-  signalVector *L[Nf];
-  signalVector::iterator Lptr;
-  float d = 1.0;
-  for(int i = 0; i < Nf; i++) {
-    d = G0.begin()->norm2() + G1.begin()->norm2();
-    L[i] = new signalVector(Nf+nu);
-    Lptr = L[i]->begin()+i;
-    G0ptr = G0.begin(); G1ptr = G1.begin();
-    while ((G0ptr < G0.end()) &&  (Lptr < L[i]->end())) {
-      *Lptr = (*G0ptr*(G0.begin()->conj()) + *G1ptr*(G1.begin()->conj()) )/d;
-      Lptr++;
-      G0ptr++;
-      G1ptr++;
-    }
-    complex k = (*G1.begin())/(*G0.begin());
-
-    if (i != Nf-1) {
-      signalVector G0new = G1;
-      scaleVector(G0new,k.conj());
-      addVector(G0new,G0);
-
-      signalVector G1new = G0;
-      scaleVector(G1new,k*(-1.0));
-      addVector(G1new,G1);
-      delayVector(&G1new, &G1new, -1.0);
-
-      scaleVector(G0new,1.0/sqrtf(1.0+k.norm2()));
-      scaleVector(G1new,1.0/sqrtf(1.0+k.norm2()));
-      G0 = G0new;
-      G1 = G1new;
-    }
-  }
-
-  *feedbackFilter = new signalVector(nu);
-  L[Nf-1]->segmentCopyTo(**feedbackFilter,Nf,nu);
-  scaleVector(**feedbackFilter,(complex) -1.0);
-  conjugateVector(**feedbackFilter);
-
-  signalVector v(Nf);
-  signalVector::iterator vStart = v.begin();
-  signalVector::iterator vPtr;
-  *(vStart+Nf-1) = (complex) 1.0;
-  for(int k = Nf-2; k >= 0; k--) {
-    Lptr = L[k]->begin()+k+1;
-    vPtr = vStart + k+1;
-    complex v_k = 0.0;
-    for (int j = k+1; j < Nf; j++) {
-      v_k -= (*vPtr)*(*Lptr);
-      vPtr++; Lptr++;
-    }
-     *(vStart + k) = v_k;
-  }
-
-  *feedForwardFilter = new signalVector(Nf);
-  signalVector::iterator w = (*feedForwardFilter)->end();
-  for (int i = 0; i < Nf; i++) {
-    delete L[i];
-    complex w_i = 0.0;
-    int endPt = ( nu < (Nf-1-i) ) ? nu : (Nf-1-i);
-    vPtr = vStart+i;
-    chanPtr = channelResponse.begin();
-    for (int k = 0; k < endPt+1; k++) {
-      w_i += (*vPtr)*(chanPtr->conj());
-      vPtr++; chanPtr++;
-    }
-    *--w = w_i/d;
-  }
-
-
-  return true;
-  
-}
-
-// Assumes symbol-rate sampling!!!!
-SoftVector *equalizeBurst(signalVector &rxBurst,
-		       float TOA,
-		       int sps,
-		       signalVector &w, // feedforward filter
-		       signalVector &b) // feedback filter
-{
-  signalVector *postForwardFull;
-
-  if (!delayVector(&rxBurst, &rxBurst, -TOA))
+  dec = demodCommon(burst, sps, chan, toa);
+  if (!dec)
     return NULL;
 
-  postForwardFull = convolve(&rxBurst, &w, NULL,
-                             CUSTOM, 0, rxBurst.size() + w.size() - 1);
-  if (!postForwardFull)
-    return NULL;
+  /* Equalize and derotate */
+  eq = convolve(dec, GSMPulse4->c0_inv, NULL, NO_DELAY);
+  rot = derotateEdgeBurst(*eq, 1);
 
-  signalVector* postForward = new signalVector(rxBurst.size());
-  postForwardFull->segmentCopyTo(*postForward,w.size()-1,rxBurst.size());
-  delete postForwardFull;
+  /* Soft slice and normalize */
+  bits = softSliceEdgeBurst(*rot);
+  vectorSlicer(bits);
 
-  signalVector::iterator dPtr = postForward->begin();
-  signalVector::iterator dBackPtr;
-  signalVector::iterator rotPtr = GMSKRotationN->begin();
-  signalVector::iterator revRotPtr = GMSKReverseRotationN->begin();
+  delete dec;
+  delete eq;
+  delete rot;
 
-  signalVector *DFEoutput = new signalVector(postForward->size());
-  signalVector::iterator DFEItr = DFEoutput->begin();
-
-  // NOTE: can insert the midamble and/or use midamble to estimate BER
-  for (; dPtr < postForward->end(); dPtr++) {
-    dBackPtr = dPtr-1;
-    signalVector::iterator bPtr = b.begin();
-    while ( (bPtr < b.end()) && (dBackPtr >= postForward->begin()) ) {
-      *dPtr = *dPtr + (*bPtr)*(*dBackPtr);
-      bPtr++;
-      dBackPtr--;
-    }
-    *dPtr = *dPtr * (*revRotPtr);
-    *DFEItr = *dPtr;
-    // make decision on symbol
-    *dPtr = (dPtr->real() > 0.0) ? 1.0 : -1.0;
-    //*DFEItr = *dPtr;
-    *dPtr = *dPtr * (*rotPtr);
-    DFEItr++;
-    rotPtr++;
-    revRotPtr++;
-  }
-
-  vectorSlicer(DFEoutput);
-
-  SoftVector *burstBits = new SoftVector(postForward->size());
-  SoftVector::iterator burstItr = burstBits->begin();
-  DFEItr = DFEoutput->begin();
-  for (; DFEItr < DFEoutput->end(); DFEItr++) 
-    *burstItr++ = DFEItr->real();
-
-  delete postForward;
-
-  delete DFEoutput;
-
-  return burstBits;
+  return bits;
 }
 
-bool sigProcLibSetup(int sps)
+bool sigProcLibSetup()
 {
-  if ((sps != 1) && (sps != 4))
-    return false;
-
   initTrigTables();
   generateSincTable();
-  initGMSKRotationTables(sps);
+  initGMSKRotationTables();
 
-  GSMPulse1 = generateGSMPulse(1, 2);
-  if (sps > 1)
-    GSMPulse = generateGSMPulse(sps, 2);
+  GSMPulse1 = generateGSMPulse(1);
+  GSMPulse4 = generateGSMPulse(4);
 
-  if (!generateRACHSequence(1)) {
-    sigProcLibDestroy();
-    return false;
+  generateRACHSequence(1);
+  for (int tsc = 0; tsc < 8; tsc++) {
+    generateMidamble(1, tsc);
+    gEdgeMidambles[tsc] = generateEdgeMidamble(tsc);
   }
 
   generateDelayFilters();
 
+  dnsampler = new Resampler(1, 4);
+  if (!dnsampler->init()) {
+    LOG(ALERT) << "Rx resampler failed to initialize";
+    goto fail;
+  }
+
   return true;
+
+fail:
+  sigProcLibDestroy();
+  return false;
 }

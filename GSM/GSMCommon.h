@@ -46,12 +46,15 @@ namespace GSM {
 
 /** GSM Training sequences from GSM 05.02 5.2.3. */
 extern const BitVector gTrainingSequence[];
+extern const BitVector gEdgeTrainingSequence[];
 
 /** C0T0 filler burst, GSM 05.02, 5.2.6 */
 extern const BitVector gDummyBurst;
 
 /** Random access burst synch. sequence */
 extern const BitVector gRACHSynchSequence;
+/** Random access burst synch. sequence, GSM 05.02 5.2.7 */
+extern const BitVector gRACHBurst;
 
 
 /**@name Modulus operations for frame numbers. */

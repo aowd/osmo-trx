@@ -20,6 +20,11 @@
 #include "BitVector.h"
 #include "signalVector.h"
 
+/* Burst lengths */
+#define NORMAL_BURST_NBITS		148
+#define EDGE_BURST_NBITS		444
+#define EDGE_BURST_NSYMS		(EDGE_BURST_NBITS / 3)
+
 /** Convolution type indicator */
 enum ConvType {
   START_ONLY,
@@ -49,7 +54,7 @@ float vectorNorm2(const signalVector &x);
 float vectorPower(const signalVector &x);
 
 /** Setup the signal processing library */
-bool sigProcLibSetup(int sps);
+bool sigProcLibSetup();
 
 /** Destroy the signal processing library */
 void sigProcLibDestroy(void);
@@ -104,6 +109,25 @@ signalVector *modulateBurst(const BitVector &wBurst,
 			    int guardPeriodLength,
 			    int sps, bool emptyPulse = false);
 
+/** 8-PSK modulate a burst of bits */
+signalVector *modulateEdgeBurst(const BitVector &bits,
+                                int sps, bool emptyPulse = false);
+
+/** Generate a EDGE burst with random payload - 4 SPS (625 samples) only */
+signalVector *generateEdgeBurst(int tsc);
+
+/** Generate an empty burst - 4 or 1 SPS */
+signalVector *generateEmptyBurst(int sps, int tn);
+
+/** Generate a normal GSM burst with random payload - 4 or 1 SPS */
+signalVector *genRandNormalBurst(int tsc, int sps, int tn);
+
+/** Generate an access GSM burst with random payload - 4 or 1 SPS */
+signalVector *genRandAccessBurst(int delay, int sps, int tn);
+
+/** Generate a dummy GSM burst - 4 or 1 SPS */
+signalVector *generateDummyBurst(int sps, int tn);
+
 /** Sinc function */
 float sinc(float x);
 
@@ -152,22 +176,6 @@ void scaleVector(signalVector &x,
 		 complex scale);
 
 /**
-        Generate a modulated GSM midamble, stored within the library.
-        @param gsmPulse The GSM pulse used for modulation.
-        @param sps The number of samples per GSM symbol.
-        @param TSC The training sequence [0..7]
-        @return Success.
-*/
-bool generateMidamble(int sps, int tsc);
-/**
-        Generate a modulated RACH sequence, stored within the library.
-        @param gsmPulse The GSM pulse used for modulation.
-        @param sps The number of samples per GSM symbol.
-        @return Success.
-*/
-bool generateRACHSequence(int sps);
-
-/**
         Energy detector, checks to see if received burst energy is above a threshold.
         @param rxBurst The received GSM burst of interest.
         @param windowLength The number of burst samples used to compute burst energy
@@ -187,13 +195,15 @@ bool energyDetect(signalVector &rxBurst,
         @param sps The number of samples per GSM symbol.
         @param amplitude The estimated amplitude of received RACH burst.
         @param TOA The estimate time-of-arrival of received RACH burst.
+        @param maxTOA The maximum expected time-of-arrival
         @return positive if threshold value is reached, negative on error, zero otherwise
 */
 int detectRACHBurst(signalVector &rxBurst,
                     float detectThreshold,
                     int sps,
                     complex &amplitude,
-                    float &TOA);
+                    float &TOA,
+                    unsigned maxTOA);
 
 /**
         Normal burst correlator, detector, channel estimator.
@@ -215,10 +225,34 @@ int analyzeTrafficBurst(signalVector &rxBurst,
                         int sps,
                         complex &amplitude,
                         float &TOA,
-                        unsigned maxTOA,
-                        bool requestChannel = false,
-                        signalVector** channelResponse = NULL,
-                        float *channelResponseOffset = NULL);
+                        unsigned maxTOA);
+
+/**
+        EDGE burst detector
+        @param burst The received GSM burst of interest
+ 
+        @param detectThreshold The threshold that the received burst's post-correlator SNR is compared against to determine validity.
+        @param sps The number of samples per GSM symbol.
+        @param amplitude The estimated amplitude of received TSC burst.
+        @param TOA The estimate time-of-arrival of received TSC burst.
+        @param maxTOA The maximum expected time-of-arrival
+        @return positive if threshold value is reached, negative on error, zero otherwise
+*/
+int detectEdgeBurst(signalVector &burst,
+                    unsigned TSC,
+                    float detectThreshold,
+                    int sps,
+                    complex &amplitude,
+                    float &TOA,
+                    unsigned maxTOA);
+
+/**
+	Downsample 4 SPS to 1 SPS using a polyphase filterbank
+        @param burst Input burst of at least 624 symbols
+        @return Decimated signal vector of 156 symbols
+*/
+
+signalVector *downsampleBurst(signalVector &burst);
 
 /**
 	Decimate a vector.
@@ -241,33 +275,14 @@ SoftVector *demodulateBurst(signalVector &rxBurst, int sps,
                             complex channel, float TOA);
 
 /**
-	Design the necessary filters for a decision-feedback equalizer.
-	@param channelResponse The multipath channel that we're mitigating.
-	@param SNRestimate The signal-to-noise estimate of the channel, a linear value
-	@param Nf The number of taps in the feedforward filter.
-	@param feedForwardFilter The designed feed forward filter.
-	@param feedbackFilter The designed feedback filter.
-	@return True if DFE can be designed.
+        Demodulate 8-PSK EDGE burst with soft symbol ooutput
+	@param rxBurst The burst to be demodulated.
+        @param sps The number of samples per GSM symbol.
+        @param channel The amplitude estimate of the received burst.
+        @param TOA The time-of-arrival of the received burst.
+        @return The demodulated bit sequence.
 */
-bool designDFE(signalVector &channelResponse,
-	       float SNRestimate,
-	       int Nf,
-	       signalVector **feedForwardFilter,
-	       signalVector **feedbackFilter);
-
-/**
-	Equalize/demodulate a received burst via a decision-feedback equalizer.
-	@param rxBurst The received burst to be demodulated.
-	@param TOA The time-of-arrival of the received burst.
-	@param sps The number of samples per GSM symbol.
-	@param w The feed forward filter of the DFE.
-	@param b The feedback filter of the DFE.
-	@return The demodulated bit sequence.
-*/
-SoftVector *equalizeBurst(signalVector &rxBurst,
-		       float TOA,
-		       int sps,
-		       signalVector &w, 
-		       signalVector &b);
+SoftVector *demodEdgeBurst(signalVector &rxBurst, int sps,
+                           complex channel, float TOA);
 
 #endif /* SIGPROCLIB_H */

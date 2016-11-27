@@ -54,7 +54,7 @@ struct TransceiverState {
   ~TransceiverState();
 
   /* Initialize a multiframe slot in the filler table */
-  bool init(int filler, size_t sps, float scale, size_t rtsc);
+  bool init(int filler, size_t sps, float scale, size_t rtsc, unsigned rach_delay);
 
   int chanType[8];
 
@@ -98,7 +98,7 @@ public:
   */
   Transceiver(int wBasePort,
               const char *TRXAddress,
-              size_t wSPS, size_t chans,
+              size_t tx_sps, size_t rx_sps, size_t chans,
               GSM::Time wTransmitLatency,
               RadioInterface *wRadioInterface,
               double wRssiOffset);
@@ -107,7 +107,7 @@ public:
   ~Transceiver();
 
   /** Start the control loop */
-  bool init(int filler, size_t rtsc);
+  bool init(int filler, size_t rtsc, unsigned rach_delay, bool edge);
 
   /** attach the radioInterface receive FIFO */
   bool receiveFIFO(VectorFIFO *wFIFO, size_t chan)
@@ -147,13 +147,16 @@ public:
     OFF,               ///< timeslot is off
     TSC,	       ///< timeslot should contain a normal burst
     RACH,	       ///< timeslot should contain an access burst
+    EDGE,	       ///< timeslot should contain an EDGE burst
     IDLE	       ///< timeslot is an idle (or dummy) burst
   } CorrType;
 
   enum FillerType {
     FILLER_DUMMY,
     FILLER_ZERO,
-    FILLER_RAND,
+    FILLER_NORM_RAND,
+    FILLER_EDGE_RAND,
+    FILLER_ACCESS_RAND,
   };
 
 private:
@@ -208,31 +211,26 @@ private:
   /** send messages over the clock socket */
   void writeClockInterface(void);
 
-  /** Detect RACH bursts */
-  int detectRACH(TransceiverState *state,
-                 signalVector &burst,
-                 complex &amp, float &toa);
+  /** Detectbursts */
+  int detectBurst(signalVector &burst,
+                  complex &amp, float &toa, CorrType type);
 
-  /** Detect normal bursts */
-  int detectTSC(TransceiverState *state,
-                signalVector &burst,
-                complex &amp, float &toa, GSM::Time &time);
-
-  /** Demodulat burst and output soft bits */
-  SoftVector *demodulate(TransceiverState *state,
-                         signalVector &burst, complex amp,
-                         float toa, size_t tn, bool equalize);
+  /** Demodulate burst and output soft bits */
+  SoftVector *demodulate(signalVector &burst,
+                         complex amp, float toa, CorrType type);
 
   int mSPSTx;                          ///< number of samples per Tx symbol
   int mSPSRx;                          ///< number of samples per Rx symbol
   size_t mChans;
 
+  bool mEdge;
   bool mOn;	                           ///< flag to indicate that transceiver is powered on
   bool mHandover[8][8];                ///< expect handover to the timeslot/subslot
   double mTxFreq;                      ///< the transmit frequency
   double mRxFreq;                      ///< the receive frequency
   unsigned mTSC;                       ///< the midamble sequence code
-  unsigned mMaxExpectedDelay;          ///< maximum expected time-of-arrival offset in GSM symbols
+  unsigned mMaxExpectedDelayAB;        ///< maximum expected time-of-arrival offset in GSM symbols for Access Bursts (RACH)
+  unsigned mMaxExpectedDelayNB;        ///< maximum expected time-of-arrival offset in GSM symbols for Normal Bursts
   unsigned mWriteBurstToDiskMask;      ///< debug: bitmask to indicate which timeslots to dump to disk
 
   std::vector<TransceiverState> mStates;
@@ -279,6 +277,8 @@ protected:
   /** set priority on current thread */
   void setPriority(float prio = 0.5) { mRadioInterface->setPriority(prio); }
 
+  void logRxBurst(size_t chan, SoftVector *burst, GSM::Time time, double dbm,
+                  double rssi, double noise, double toa);
 };
 
 void *RxUpperLoopAdapter(TransceiverChannel *);
