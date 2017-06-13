@@ -662,8 +662,7 @@ bool uhd_device::parse_dev_type()
 	x300_str = mboard_str.find("X300");
 	x310_str = mboard_str.find("X310");
 	umtrx_str = dev_str.find("UmTRX");
-	// LimeSDR is based on STREAM board, so it's advertized as such
-	limesdr_str = dev_str.find("STREAM");
+	limesdr_str = mboard_str.find("LimeSDR");
 
 	if (usrp1_str != std::string::npos) {
 		LOG(ALERT) << "USRP1 is not supported using the UHD driver";
