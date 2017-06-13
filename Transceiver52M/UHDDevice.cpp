@@ -1352,7 +1352,7 @@ TIMESTAMP uhd_device::initialReadTimestamp()
 double uhd_device::fullScaleInputValue()
 {
 	if (dev_type == LIMESDR)
-		return (double) 2047 * LIMESDR_TX_AMPL;
+		return (double) 32767 * LIMESDR_TX_AMPL;
 	if (dev_type == UMTRX)
 		return (double) SHRT_MAX * UMTRX_TX_AMPL;
 	else
@@ -1361,7 +1361,7 @@ double uhd_device::fullScaleInputValue()
 
 double uhd_device::fullScaleOutputValue()
 {
-	if (dev_type == LIMESDR) return (double) 2047;
+	if (dev_type == LIMESDR) return (double) 32767.0;
 	return (double) SHRT_MAX;
 }
 
