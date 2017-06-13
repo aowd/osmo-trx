@@ -703,7 +703,7 @@ bool uhd_device::parse_dev_type()
 		tx_window = TX_WINDOW_FIXED;
 		dev_type = UMTRX;
 	} else if (limesdr_str != std::string::npos) {
-		tx_window = TX_WINDOW_USRP1;
+		tx_window = TX_WINDOW_FIXED;
 		dev_type = LIMESDR;
 	} else {
 		LOG(ALERT) << "Unknown UHD device type "
