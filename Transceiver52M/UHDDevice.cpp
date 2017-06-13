@@ -134,7 +134,7 @@ static struct uhd_dev_offset uhd_offsets[] = {
 	{ B210,  4, 4, B2XX_TIMING_4_4SPS, "B210 4 SPS" },
 	{ X3XX,  4, 4, 5.6567e-5, "X3XX 4 SPS"},
 	{ UMTRX, 4, 4, 5.1503e-5, "UmTRX 4 SPS" },
-	{ LIMESDR, 4, 4, 16.5/GSMRATE, "STREAM/LimeSDR (4 SPS TX/RX)" },
+	{ LIMESDR, 4, 4, 8.9e-5, "LimeSDR 4 SPS" },
 };
 #define NUM_UHD_OFFSETS (sizeof(uhd_offsets)/sizeof(uhd_offsets[0]))
 
